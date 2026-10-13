@@ -76,17 +76,29 @@ class Point:
     source: str = ""
     raw: str = ""
     notes: list[str] = field(default_factory=list)
+    longitude: float | None = None
+    latitude: float | None = None
+    altitude: float | None = None
+    box: list[float] = field(default_factory=list)
+    field_boxes: dict = field(default_factory=dict)
+    field_confidence: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict) -> Point:
         p = cls(**{key: val for key, val in data.items() if key in cls.__dataclass_fields__})
         p.code, p.destination = normal_id(p.code), normal_id(p.destination)
-        for name in ("x", "y", "distance", "bearing", "confidence"):
+        for name in ("x", "y", "distance", "bearing", "confidence", "longitude", "latitude", "altitude"):
             value = getattr(p, name)
             if value is not None and (not isinstance(value, (int, float)) or not math.isfinite(value)):
                 raise ValueError(f"Campo {name} inválido no projeto.")
         if not isinstance(p.notes, list) or not all(isinstance(n, str) for n in p.notes):
             raise ValueError("Observações inválidas no projeto.")
+        if p.longitude is not None and not -180 <= p.longitude <= 180 or p.latitude is not None and not -90 <= p.latitude <= 90:
+            raise ValueError("Latitude ou longitude fora do intervalo permitido.")
+        if not isinstance(p.box, list) or len(p.box) not in (0, 4) or any(not isinstance(v, (int, float)) or not math.isfinite(v) for v in p.box):
+            raise ValueError("Recorte de imagem inválido.")
+        if not isinstance(p.field_boxes, dict) or not isinstance(p.field_confidence, dict):
+            raise ValueError("Metadados de leitura inválidos.")
         return p
 
 
@@ -95,6 +107,22 @@ class ParseResult:
     points: list[Point] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     text: str = ""
+    area_m2: float | None = None
+    perimeter_m: float | None = None
+
+
+def column_map(cells: list[str]) -> dict[str, int]:
+    mapping = {}
+    aliases = {"e": "x", "x": "x", "em": "x", "xm": "x", "exm": "x", "este": "x", "estem": "x", "leste": "x", "lestem": "x", "n": "y", "y": "y", "nm": "y", "ym": "y", "nym": "y", "norte": "y", "nortem": "y",
+               "altitude": "altitude", "altitudem": "altitude", "destino": "destination", "proximovertice": "destination",
+               "azimute": "bearing", "azimutegraus": "bearing", "dist": "distance", "distm": "distance", "distancia": "distance", "distanciam": "distance"}
+    for i, cell in enumerate(cells):
+        key = re.sub(r"[^a-z0-9]", "", "".join(c for c in unicodedata.normalize("NFKD", cell.lower()) if not unicodedata.combining(c)))
+        if key in {"codigo", "cod", "id", "ponto", "code", "vertice"}:
+            mapping["destination" if "code" in mapping else "code"] = i
+        elif key in aliases:
+            mapping[aliases[key]] = i
+    return mapping
 
 
 def optional_number(text: str, notes: list[str], label: str) -> float | None:
@@ -132,6 +160,7 @@ def parse_cells(cells: list[str], source: str = "", confidence: float | None = N
 
 def parse_table_text(text: str, source: str = "texto") -> ParseResult:
     result = ParseResult(text=text)
+    headers = None
     for line_no, line in enumerate(text.splitlines(), 1):
         s = line.strip()
         if not s:
@@ -145,10 +174,14 @@ def parse_table_text(text: str, source: str = "texto") -> ParseResult:
         elif re.match(r"[^,]+,[-+]?\d+\.\d+,[-+]?\d+\.\d+", s):
             cells = next(csv.reader([s]))
         if cells and len(cells) >= 3:
-            if normal_id(cells[0]) in {"CODIGO", "CÓDIGO", "ID", "PONTO", "CODE"}:
+            mapping = column_map(cells)
+            if all(k in mapping for k in ("code", "x", "y")):
+                headers = mapping
                 continue
             # CSV exportado: código;E;N;destino;distância;azimute.
-            if len(cells) == 6:
+            if headers:
+                p = parse_cells([cells[headers[k]] if k in headers and headers[k] < len(cells) else "" for k in ("code", "x", "y", "altitude", "destination", "bearing", "distance")], source, row=line_no)
+            elif len(cells) == 6:
                 p = parse_cells([cells[0], cells[1], cells[2], "", cells[3], cells[5], cells[4]], source, row=line_no)
             else:
                 p = parse_cells(cells, source, row=line_no)
@@ -181,6 +214,9 @@ def parse_table_text(text: str, source: str = "texto") -> ParseResult:
                 if rest:
                     cells[6] = rest[0]
         point = parse_cells(cells, source, row=line_no)
+        if len(matches) > 1 and len(nums) != 3:
+            point.x = point.y = None
+            point.notes.append("Posição das colunas incerta: use CSV com cabeçalho ou releia a imagem por células.")
         point.raw = s
         if point.destination and (point.bearing is None or point.distance is None):
             point.notes.append("Trecho com azimute ou distância não interpretado; conferir na fonte")
@@ -188,7 +224,7 @@ def parse_table_text(text: str, source: str = "texto") -> ParseResult:
     return result
 
 
-def parse_memorial(text: str) -> ParseResult:
+def _parse_memorial_legacy(text: str) -> ParseResult:
     """Lê vértices identificados e E/N explícitos. Nunca deduz coordenadas sem rótulos."""
     result = ParseResult(text=text)
     normalized = unicodedata.normalize("NFKD", text)
@@ -228,6 +264,11 @@ def parse_memorial(text: str) -> ParseResult:
         if not result.points:
             result.warnings.append("Nenhum vértice interpretado. Use a tabela editável ou texto com 'vértice ID, E ..., N ...'.")
     return result
+
+
+def parse_memorial(text: str) -> ParseResult:
+    from .memorial import parse_document
+    return parse_document(text)
 
 
 def validate(points: list[Point]) -> list[str]:
@@ -321,6 +362,9 @@ def compare(table: list[Point], memorial: list[Point], coord_tol: float = .02, d
 
 def make_script(points: list[Point], contour: bool = False, close: bool = True) -> str:
     errors = validate(points)
+    if contour and not errors:
+        from .conference import contour_issues
+        errors = contour_issues(points, close)
     if errors:
         raise ValueError("\n".join(errors))
     if contour and len(points) < (3 if close else 2):

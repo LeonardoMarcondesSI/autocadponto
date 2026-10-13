@@ -13,6 +13,7 @@ pillow==12.3.0
 protobuf==7.36.2
 pyclipper==1.4.0
 pymupdf==1.28.2
+pyproj==3.8.0
 PyYAML==6.0.3
 rapidocr==3.10.0
 requests==2.34.2

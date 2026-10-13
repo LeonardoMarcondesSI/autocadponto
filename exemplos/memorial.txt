@@ -1,5 +1,7 @@
 EXEMPLO FICTÍCIO — coordenadas planas em metros no mesmo sistema da tabela.
 
+Área: 1,0000 ha. Perímetro: 400,00 m. Azimutes e distâncias de grade.
+
 Inicia-se no vértice P-001, de coordenadas E 500.000,00 m e N 7.500.000,00 m.
 Deste, segue com azimute de 90°00' e distância de 100,00 m até o vértice P-002,
 de coordenadas E 500.100,00 m e N 7.500.000,00 m.

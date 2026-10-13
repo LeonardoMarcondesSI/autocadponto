@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import median
 from typing import Callable
@@ -15,6 +15,7 @@ class ReadResult:
     parsed: ParseResult
     preview: object = None
     rotation: int = 0
+    pages: dict = field(default_factory=dict)
 
 
 def rectify(image):
@@ -57,8 +58,18 @@ def group_lines(boxes, texts, scores) -> list[tuple[str, float]]:
     for box, text, score in zip(boxes, texts, scores):
         xs = [float(p[0]) for p in box]
         ys = [float(p[1]) for p in box]
-        items.append((sum(xs)/4, sum(ys)/4, max(ys)-min(ys), text, float(score)))
-    tolerance = max(4, median(i[2] for i in items) * .65)
+        width = max(xs)-min(xs)
+        slope = ((ys[1]+ys[2])-(ys[0]+ys[3])) / max(1, (xs[1]+xs[2])-(xs[0]+xs[3]))
+        height = ((ys[3]-ys[0])+(ys[2]-ys[1]))/2
+        items.append((sum(xs)/4, sum(ys)/4, max(5,height), text, float(score), slope, width))
+    reference_x = median(i[0] for i in items)
+    adjusted = []
+    for item in items:
+        nearby = [i[5] for i in items if i[6] > 120 and abs(i[1]-item[1]) < 140 and abs(i[5]) < .2]
+        slope = median(nearby) if nearby else 0
+        adjusted.append((item[0], item[1]-slope*(item[0]-reference_x), *item[2:]))
+    items = adjusted
+    tolerance = max(3, median(i[2] for i in items) * .45)
     groups: list[list[tuple]] = []
     for item in sorted(items, key=lambda i: i[1]):
         if groups and abs(item[1] - median(i[1] for i in groups[-1])) < tolerance:
@@ -98,32 +109,33 @@ class Reader:
 
     def table_image(self, image, source: str, rotation: int | None = None, progress=lambda _: None) -> ReadResult:
         from PIL import ImageOps
+        from .table_ocr import detect_grid, find_header, read_grid
         image = ImageOps.exif_transpose(image).convert("RGB")
         image.thumbnail((4000, 4000))
         rotations = [rotation] if rotation is not None else ([90, 0, 270, 180] if image.height > image.width else [0, 90, 180, 270])
-        best, best_score = None, -1
+        candidates = []
         for degrees in rotations:
-            progress(f"Preparando a tabela · orientação {degrees}°…")
+            progress(f"Conferindo cabeçalhos e grade · orientação {degrees}°…")
             prepared = rectify(image.rotate(degrees, expand=True))
-            lines = self.ocr(prepared, progress)
-            text = "\n".join(line for line, _ in lines)
-            parsed = parse_table_text(text, source)
-            for p in parsed.points:
-                for line, score in lines:
-                    if p.raw == line:
-                        p.confidence = score
-                        if score < .95:
-                            p.notes.append("Confiança OCR baixa: conferir os valores na imagem")
-                        break
-            score = sum(p.x is not None and p.y is not None for p in parsed.points)
-            if score > best_score:
-                best, best_score = ReadResult(parsed, prepared, degrees), score
-            if score >= 3:
-                break
-        if not best.parsed.points:
-            best.parsed.warnings.append("Não foi possível organizar a tabela. Tente outra orientação ou uma foto mais próxima.")
-        best.parsed.warnings.append("Revise a quantidade de linhas, as identificações e os dígitos. Confiança OCR não garante exatidão.")
-        return best
+            grid = detect_grid(prepared)
+            header = find_header(self, grid) if grid else None
+            if header:
+                candidates.append((header[0], degrees, grid, header))
+        if candidates:
+            _, degrees, grid, header = max(candidates, key=lambda item:item[0])
+            parsed = read_grid(self, grid, header, source, progress)
+            if len(candidates)>1 and candidates[0][0] == candidates[1][0]:
+                parsed.warnings.append('Mais de uma orientação parece possível; confira os cabeçalhos e a ordem.')
+            return ReadResult(parsed, grid.image, degrees, {source:grid.image})
+        # Sem grade/cabeçalhos seguros, preservar o texto sem atribuir números a eixos.
+        prepared = rectify(image.rotate(rotation or 0, expand=True))
+        text = '\n'.join(t for t,_ in self.ocr(prepared,progress))
+        parsed = parse_table_text(text, source)
+        for p in parsed.points:
+            p.x = p.y = None
+            p.notes.append('Colunas não identificadas: coordenadas precisam de revisão manual.')
+        parsed.warnings.append('Não foi possível identificar E/N e a grade. Tente outra orientação, um recorte da tabela ou uma lista CSV.')
+        return ReadResult(parsed, prepared, rotation or 0, {source:prepared})
 
     def read_table(self, path: Path, rotation: int | None = None, progress=lambda _: None) -> ReadResult:
         from PIL import Image
@@ -134,6 +146,7 @@ class Reader:
             import pymupdf
             combined = ParseResult()
             preview = None
+            pages = {}
             with pymupdf.open(path) as document:
                 if document.is_encrypted:
                     raise ValueError("PDF protegido. Salve uma cópia desbloqueada para leitura.")
@@ -143,10 +156,11 @@ class Reader:
                     im = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
                     result = self.table_image(im, f"{path.name}, pág. {idx+1}", rotation, progress)
                     preview = preview or result.preview
+                    pages.update(result.pages)
                     combined.points += result.parsed.points
                     combined.warnings += [f"Página {idx+1}: {w}" for w in result.parsed.warnings]
                     combined.text += f"\n--- Página {idx+1} ---\n{result.parsed.text}"
-            return ReadResult(combined, preview)
+            return ReadResult(combined, preview, pages=pages)
         with Image.open(path) as im:
             return self.table_image(im, path.name, rotation, progress)
 
@@ -175,16 +189,17 @@ class Reader:
         return "\n\n".join(pages)
 
     def document_image(self, image, rotation, progress):
+        from .core import parse_memorial
         rotations = [rotation] if rotation is not None else [0, 90, 180, 270]
         best, best_score = "", -1
         for angle in rotations:
+            progress(f'Lendo memorial · orientação {angle}°…')
             lines = self.ocr(image.rotate(angle, expand=True), progress)
             text = "\n".join(t for t, _ in lines)
-            score = len(re.findall(r"(?:v[eé]rtice|coordenada|dist[aâ]ncia|azimute|norte)", text, re.I))
+            parsed = parse_memorial(text)
+            score = sum(3*(p.latitude is not None and p.longitude is not None or p.x is not None and p.y is not None) + (p.distance is not None) for p in parsed.points)
             if score > best_score:
                 best, best_score = text, score
-            if score >= 2:
-                break
         return best
 
 
